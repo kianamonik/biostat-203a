@@ -341,6 +341,24 @@ xgb_acc
 xgb_sens
 autoplot(xgb_cm, type = "heatmap") +
   labs(title = "XGBoost: Confusion Matrix")
+
+# XGBoost variable importance
+xgb_fit_obj <- extract_fit_parsnip(xgb_fit)$fit
+xgb_imp <- xgb.importance(model = xgb_fit_obj)
+
+# Turn into tibble and plot top 15 by Gain
+xgb_imp %>%
+  as_tibble() %>%
+  slice_max(Gain, n = 15) %>%
+  ggplot(aes(x = reorder(Feature, Gain), y = Gain)) +
+  geom_col() +
+  coord_flip() +
+  labs(
+    title = "XGBoost: Top 15 variable importances",
+    x = NULL,
+    y = "Gain"
+  ) +
+  theme_minimal()
 ```
 
 
