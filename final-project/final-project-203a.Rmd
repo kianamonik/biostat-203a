@@ -4,3 +4,216 @@ output: pdf_document
 auhtor: "Kiana Mohammadinik"
 ---
 
+```{r, message=FALSE, warning=FALSE}
+library(tidyverse)
+library(janitor)       
+library(caret)        
+library(nnet)          
+library(randomForest)
+library(skimr)
+library(tidymodels)
+library(GGally)
+
+
+tidymodels::tidymodels_prefer()
+set.seed(20251212)
+
+# Read data 
+fetal_raw <- read_csv("fetal_health.csv")
+
+# Clean column names: 'baseline value' -> baseline_value, etc.
+fetal <- fetal_raw %>%
+  clean_names() %>%
+  mutate(
+    fetal_health = factor(
+      fetal_health,
+      levels = c(1, 2, 3),
+      labels = c("Normal", "Suspect", "Pathological")
+    )
+  )
+
+glimpse(fetal)
+```
+
+## EDA
+```{r}
+# outcome distribution
+fetal %>%
+  count(fetal_health) %>%
+  mutate(prop = n / sum(n))
+
+fetal %>%
+  ggplot(aes(x = fetal_health, fill = fetal_health)) +
+  geom_bar() +
+  scale_fill_manual(
+    values = rev(hcl.colors(3, "RdYlGn")),
+    guide = "none"
+  ) +
+  labs(
+    x = "Fetal health (target class)",
+    y = "Count",
+    title = "Class distribution: Normal / Suspect / Pathological"
+  )
+
+
+# summary of predictors
+fetal %>%
+  select(-fetal_health) %>%
+  summary()
+```
+
+
+```{r, fig.width=18, fig.height=18}
+library(tidyverse)
+library(stringr)
+
+# correlation matrix (predictors only)
+X <- fetal %>% select(-fetal_health)
+C <- cor(X, use = "pairwise.complete.obs")
+
+cor_long <- as.data.frame(C) %>%
+  rownames_to_column("var1") %>%
+  pivot_longer(-var1, names_to = "var2", values_to = "r")
+
+cor_long <- cor_long %>%
+  mutate(
+    var1 = factor(var1, levels = colnames(C)),
+    var2 = factor(var2, levels = colnames(C))
+  ) %>%
+  filter(as.integer(var1) <= as.integer(var2))
+
+ggplot(cor_long, aes(var2, var1, fill = r)) +
+  geom_tile() +
+  coord_equal() +
+  scale_fill_gradientn(colors = hcl.colors(20, "RdYlGn")) +
+  scale_x_discrete(labels = function(x) str_wrap(x, width = 14)) +
+  scale_y_discrete(labels = function(x) str_wrap(x, width = 14)) +
+  labs(title = "Predictor Correlations", x = NULL, y = NULL, fill = "r") +
+  theme_minimal() +
+  theme(
+    plot.title = element_text(hjust = 0.5),
+    axis.text.x = element_text(angle = 45, hjust = 1, size = 9),
+    axis.text.y = element_text(size = 9)
+  )
+```
+## Train/test split (stratified)
+```{r}
+split_obj <- initial_split(fetal, prop = 0.80, strata = fetal_health)
+train_dat <- training(split_obj)
+test_dat  <- testing(split_obj)
+
+train_dat %>% count(fetal_health) %>% mutate(prop = n/sum(n))
+test_dat  %>% count(fetal_health) %>% mutate(prop = n/sum(n))
+```
+
+## Preprocessing recipe
+```{r}
+fetal_recipe <- recipe(fetal_health ~ ., data = train_dat) %>%
+  step_zv(all_predictors()) %>%
+  step_normalize(all_numeric_predictors())
+```
+
+## Fit models
+### Multinomial logistic regression
+```{r}
+multinom_spec <- multinom_reg() %>%
+  set_mode("classification") %>%
+  set_engine("nnet", trace = FALSE)
+
+multinom_wf <- workflow() %>%
+  add_recipe(fetal_recipe) %>%
+  add_model(multinom_spec)
+
+multinom_fit <- fit(multinom_wf, data = train_dat)
+```
+
+
+
+### Random forest
+```{r}
+rf_spec <- rand_forest(trees = 1000) %>%
+  set_mode("classification") %>%
+  set_engine("ranger", importance = "impurity")
+
+rf_wf <- workflow() %>%
+  add_recipe(fetal_recipe) %>%
+  add_model(rf_spec)
+
+rf_fit <- fit(rf_wf, data = train_dat)
+```
+
+
+## Evaluate models on test set
+```{r}
+# Helper function: class-specific sensitivity from a confusion matrix
+class_sensitivity <- function(cm) {
+  m <- as.matrix(cm$table)  
+  tibble(
+    class = rownames(m),
+    sensitivity = diag(m) / rowSums(m)
+  )
+}
+
+# Multinomial logistic regression performance
+multinom_pred <- predict(multinom_fit, test_dat, type = "class") %>%
+  bind_cols(test_dat %>% select(fetal_health))
+
+multinom_acc <- accuracy(multinom_pred, truth = fetal_health, estimate = .pred_class)
+
+multinom_cm <- conf_mat(multinom_pred, truth = fetal_health, estimate = .pred_class)
+
+multinom_sens <- class_sensitivity(multinom_cm) %>%
+  filter(class %in% c("Suspect", "Pathological"))
+
+multinom_acc
+multinom_sens
+
+autoplot(multinom_cm, type = "heatmap") +
+  labs(title = "Multinomial Logistic Regression: Confusion Matrix")
+
+# Random forest performance
+rf_pred <- predict(rf_fit, test_dat, type = "class") %>%
+  bind_cols(test_dat %>% select(fetal_health))
+
+rf_acc <- accuracy(rf_pred, truth = fetal_health, estimate = .pred_class)
+
+rf_cm <- conf_mat(rf_pred, truth = fetal_health, estimate = .pred_class)
+
+rf_sens <- class_sensitivity(rf_cm) %>%
+  filter(class %in% c("Suspect", "Pathological"))
+
+rf_acc
+rf_sens
+
+autoplot(rf_cm, type = "heatmap") +
+  labs(title = "Random Forest: Confusion Matrix")
+```
+
+
+## Side-by-side model comparison
+```{r}
+bind_rows(
+  multinom_acc %>% mutate(model = "Multinomial logistic regression"),
+  rf_acc       %>% mutate(model = "Random forest")
+) %>%
+  select(model, .metric, .estimate)
+
+bind_rows(
+  multinom_sens %>% mutate(model = "Multinomial logistic regression"),
+  rf_sens       %>% mutate(model = "Random forest")
+) %>%
+  select(model, class, sensitivity) %>%
+  arrange(model, class)
+```
+
+
+
+
+
+
+
+
+
+
+
+
