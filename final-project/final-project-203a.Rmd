@@ -1,13 +1,12 @@
 ---
 title: "final-project-203a"
 output: pdf_document
-auhtor: "Kiana Mohammadinik"
+author: "Kiana Mohammadinik"
 ---
 
 ```{r, message=FALSE, warning=FALSE}
 library(tidyverse)
 library(janitor)       
-library(caret)        
 library(nnet)          
 library(randomForest)
 library(skimr)
@@ -33,6 +32,13 @@ fetal <- fetal_raw %>%
   )
 
 glimpse(fetal)
+
+# missingness check
+fetal %>%
+  summarise(across(everything(), ~ sum(is.na(.)))) %>%
+  pivot_longer(everything(), names_to = "var", values_to = "n_missing") %>%
+  arrange(desc(n_missing)) %>%
+  print(n = 50)
 ```
 
 ## EDA
@@ -105,12 +111,41 @@ test_dat  <- testing(split_obj)
 train_dat %>% count(fetal_health) %>% mutate(prop = n/sum(n))
 test_dat  %>% count(fetal_health) %>% mutate(prop = n/sum(n))
 ```
+```{r, fig.height=8}
+vars_to_plot <- c("baseline_value",
+                  "accelerations",
+                  "uterine_contractions",
+                  "light_decelerations",
+                  "prolongued_decelerations",
+                  "abnormal_short_term_variability",
+                  "mean_value_of_short_term_variability",
+                  "percentage_of_time_with_abnormal_long_term_variability",
+                  "mean_value_of_long_term_variability")
+
+fetal %>%
+  select(fetal_health, all_of(vars_to_plot)) %>%
+  pivot_longer(-fetal_health, names_to = "variable", values_to = "value") %>%
+  ggplot(aes(x = fetal_health, y = value, fill = fetal_health)) +
+  geom_boxplot(outlier.alpha = 0.2) +
+  facet_wrap(~ variable, scales = "free_y", ncol = 3) +
+  scale_fill_manual(values = rev(hcl.colors(3, "RdYlGn")), guide = "none") +
+  labs(title = "Predictor distributions by class", x = NULL, y = NULL) +
+  theme_minimal()
+```
+
 
 ## Preprocessing recipe
 ```{r}
-fetal_recipe <- recipe(fetal_health ~ ., data = train_dat) %>%
+rec_scaled <- recipe(fetal_health ~ ., data = train_dat) %>%
   step_zv(all_predictors()) %>%
   step_normalize(all_numeric_predictors())
+
+rec_unscaled <- recipe(fetal_health ~ ., data = train_dat) %>%
+  step_zv(all_predictors())
+
+folds <- vfold_cv(train_dat, v = 5, strata = fetal_health)
+
+my_metrics <- metric_set(accuracy, bal_accuracy)
 ```
 
 ## Fit models
@@ -121,7 +156,7 @@ multinom_spec <- multinom_reg() %>%
   set_engine("nnet", trace = FALSE)
 
 multinom_wf <- workflow() %>%
-  add_recipe(fetal_recipe) %>%
+  add_recipe(rec_scaled) %>%
   add_model(multinom_spec)
 
 multinom_fit <- fit(multinom_wf, data = train_dat)
@@ -136,12 +171,85 @@ rf_spec <- rand_forest(trees = 1000) %>%
   set_engine("ranger", importance = "impurity")
 
 rf_wf <- workflow() %>%
-  add_recipe(fetal_recipe) %>%
+  add_recipe(rec_unscaled) %>%
   add_model(rf_spec)
 
 rf_fit <- fit(rf_wf, data = train_dat)
 ```
 
+### Penalized multinomial (glmnet)
+```{r}
+glmnet_spec <- multinom_reg(penalty = tune(), mixture = tune()) %>%
+  set_mode("classification") %>%
+  set_engine("glmnet")
+
+glmnet_wf <- workflow() %>%
+  add_recipe(rec_scaled) %>%
+  add_model(glmnet_spec)
+
+set.seed(20251212)
+glmnet_grid <- grid_regular(
+  penalty(range = c(-4, 0)),  
+  mixture(range = c(0, 1)),
+  levels = 6
+)
+
+glmnet_res <- tune_grid(
+  glmnet_wf,
+  resamples = folds,
+  grid = glmnet_grid,
+  metrics = my_metrics,
+  control = control_grid(save_pred = TRUE)
+)
+
+collect_metrics(glmnet_res)
+best_glmnet <- select_best(glmnet_res, metric = "bal_accuracy")
+best_glmnet
+```
+
+
+### XGboost
+```{r}
+xgb_spec <- boost_tree(
+  trees = tune(),
+  tree_depth = tune(),
+  learn_rate = tune(),
+  loss_reduction = tune(),
+  sample_size = tune(),
+  mtry = tune(),
+  min_n = tune()
+) %>%
+  set_mode("classification") %>%
+  set_engine("xgboost")
+
+xgb_wf <- workflow() %>%
+  add_recipe(rec_unscaled) %>%  
+  add_model(xgb_spec)
+
+set.seed(20251212)
+xgb_grid <- grid_latin_hypercube(
+  trees(range = c(300, 1200)),
+  tree_depth(),
+  learn_rate(range = c(-4, -1)),  
+  loss_reduction(),
+  sample_size = sample_prop(),
+  mtry(range = c(3, ncol(train_dat) - 1)),
+  min_n(),
+  size = 25
+)
+
+xgb_res <- tune_grid(
+  xgb_wf,
+  resamples = folds,
+  grid = xgb_grid,
+  metrics = my_metrics,
+  control = control_grid(save_pred = TRUE)
+)
+
+collect_metrics(xgb_res)
+best_xgb <- select_best(xgb_res, metric = "bal_accuracy")
+best_xgb
+```
 
 ## Evaluate models on test set
 ```{r}
@@ -187,23 +295,74 @@ rf_sens
 
 autoplot(rf_cm, type = "heatmap") +
   labs(title = "Random Forest: Confusion Matrix")
+
+# Random Forest variable importance
+rf_fit_obj <- extract_fit_parsnip(rf_fit)$fit
+imp <- sort(rf_fit_obj$variable.importance, decreasing = TRUE)
+
+tibble(variable = names(imp), importance = as.numeric(imp)) %>%
+  slice_head(n = 15) %>%
+  ggplot(aes(x = reorder(variable, importance), y = importance)) +
+  geom_col() +
+  coord_flip() +
+  labs(title = "Random Forest: Top 15 variable importances", x = NULL, y = "Importance") +
+  theme_minimal()
+
+# glmnet performance
+glmnet_final_wf <- finalize_workflow(glmnet_wf, best_glmnet)
+glmnet_fit <- fit(glmnet_final_wf, data = train_dat)
+
+glmnet_pred <- predict(glmnet_fit, test_dat, type = "class") %>%
+  bind_cols(test_dat %>% select(fetal_health))
+
+glmnet_acc <- accuracy(glmnet_pred, truth = fetal_health, estimate = .pred_class)
+glmnet_cm  <- conf_mat(glmnet_pred, truth = fetal_health, estimate = .pred_class)
+glmnet_sens <- class_sensitivity(glmnet_cm) %>%
+  filter(class %in% c("Suspect", "Pathological"))
+
+glmnet_acc
+glmnet_sens
+autoplot(glmnet_cm, type = "heatmap") +
+  labs(title = "Penalized Multinomial (glmnet): Confusion Matrix")
+
+# XGBoost performance
+xgb_final_wf <- finalize_workflow(xgb_wf, best_xgb)
+xgb_fit <- fit(xgb_final_wf, data = train_dat)
+
+xgb_pred <- predict(xgb_fit, test_dat, type = "class") %>%
+  bind_cols(test_dat %>% select(fetal_health))
+
+xgb_acc <- accuracy(xgb_pred, truth = fetal_health, estimate = .pred_class)
+xgb_cm  <- conf_mat(xgb_pred, truth = fetal_health, estimate = .pred_class)
+xgb_sens <- class_sensitivity(xgb_cm) %>%
+  filter(class %in% c("Suspect", "Pathological"))
+
+xgb_acc
+xgb_sens
+autoplot(xgb_cm, type = "heatmap") +
+  labs(title = "XGBoost: Confusion Matrix")
 ```
 
 
 ## Side-by-side model comparison
 ```{r}
 bind_rows(
-  multinom_acc %>% mutate(model = "Multinomial logistic regression"),
-  rf_acc       %>% mutate(model = "Random forest")
+  multinom_acc %>% mutate(model = "Multinomial (nnet)"),
+  rf_acc       %>% mutate(model = "Random forest"),
+  glmnet_acc   %>% mutate(model = "Penalized multinomial (glmnet)"),
+  xgb_acc      %>% mutate(model = "XGBoost")
 ) %>%
-  select(model, .metric, .estimate)
+  select(model, .metric, .estimate) %>%
+  arrange(desc(.estimate))
 
 bind_rows(
-  multinom_sens %>% mutate(model = "Multinomial logistic regression"),
-  rf_sens       %>% mutate(model = "Random forest")
+  multinom_sens %>% mutate(model = "Multinomial (nnet)"),
+  rf_sens       %>% mutate(model = "Random forest"),
+  glmnet_sens   %>% mutate(model = "Penalized multinomial (glmnet)"),
+  xgb_sens      %>% mutate(model = "XGBoost")
 ) %>%
   select(model, class, sensitivity) %>%
-  arrange(model, class)
+  arrange(class, desc(sensitivity))
 ```
 
 
