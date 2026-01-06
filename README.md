@@ -31,13 +31,7 @@ Overall accuracy:
 - **Penalized Multinomial (glmnet):** 0.911
 - **Multinomial (nnet):** 0.908
 
-Minority-class sensitivity (recall):
-- **XGBoost:** Suspect 0.906, Pathological 1.000
-- **Random Forest:** Suspect 0.920, Pathological 1.000
-- **glmnet:** Suspect 0.717, Pathological 0.806
-- **nnet:** Suspect 0.704, Pathological 0.763
-
 ## Repository contents
 - `final-project-203a.Rmd` — full analysis (EDA, modeling, tuning, evaluation)
 - `final-project-203a.pdf` — rendered report
-- `fetal_health.csv` — dataset (or instructions to download from Kaggle)
+- `fetal_health.csv` — dataset 
